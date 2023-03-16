@@ -10,6 +10,7 @@ async function bootstrap() {
   });
 
   const corsWhitelist = [
+    'https://slimevr-firmware.bscotch.ca',
     'https://slimevr-firmware-tool.futurabeast.com',
     'http://localhost:3000',
     'http://localhost:3001',
