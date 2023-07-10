@@ -1,4 +1,4 @@
-import { BuildStatus } from 'aws-sdk/clients/gamelift';
+import { BuildStatus } from '@aws-sdk/client-gamelift';
 import { FirmwareFile } from './firmware-files.dto';
 
 export class BuildStatusMessage {

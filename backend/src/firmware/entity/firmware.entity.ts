@@ -9,12 +9,12 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 import { BuildFirmwareDTO } from '../dto/build-firmware.dto';
-import { BoardPins, BoardType } from '../dto/firmware-board.dto';
+// import { BoardPins, BoardType } from '../dto/firmware-board.dto';
 import { FirmwareFile } from '../dto/firmware-files.dto';
 
 export enum BuildStatus {
-  BUILDING = 'BUILDING',
-  DONE = 'DONE',
+  INITIALIZED = 'INITIALIZED',
+  READY = 'READY',
   FAILED = 'FAILED',
 }
 
@@ -51,7 +51,7 @@ export class Firmware extends BaseEntity {
 
   static fromDTO(dto: BuildFirmwareDTO): Firmware {
     const firmware = new Firmware();
-    firmware.buildStatus = BuildStatus.BUILDING;
+    firmware.buildStatus = BuildStatus.INITIALIZED;
     firmware.buildConfig = dto;
 
     return firmware;

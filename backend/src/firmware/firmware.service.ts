@@ -1,4 +1,4 @@
-import { Inject, Injectable, OnApplicationBootstrap } from '@nestjs/common';
+import { Inject, Injectable, Module, OnApplicationBootstrap } from '@nestjs/common';
 import { ReleaseDTO } from 'src/github/dto/release.dto';
 import { GithubService } from 'src/github/github.service';
 import { BuildFirmwareDTO } from './dto/build-firmware.dto';
@@ -10,16 +10,17 @@ import fs from 'fs';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'fs/promises';
 import path from 'path';
 import AdmZip from 'adm-zip';
-import fetch from 'node-fetch';
 import { BoardType } from './dto/firmware-board.dto';
 import { exec } from 'child_process';
-import { getConnection, Not } from 'typeorm';
-import { InjectS3 } from 'nestjs-s3';
-import { S3 } from 'aws-sdk';
+import { DataSource, Not } from 'typeorm';
+import { InjectS3, S3 } from 'nestjs-s3';
 import { APP_CONFIG, ConfigService } from 'src/config/config.service';
 import { debounceTime, filter, map, Subject } from 'rxjs';
 import { BuildStatusMessage } from './dto/build-status-message.dto';
 import { AVAILABLE_FIRMWARE_REPOS } from './firmware.constants';
+import { finished } from 'stream/promises';
+import { Readable } from 'stream';
+import { ReadableStream as NodeReadableStream } from 'stream/web';
 
 @Injectable()
 export class FirmwareService implements OnApplicationBootstrap {
@@ -29,10 +30,11 @@ export class FirmwareService implements OnApplicationBootstrap {
     @InjectS3() private s3: S3,
     private githubService: GithubService,
     @Inject(APP_CONFIG) private appConfig: ConfigService,
+    private dataSource: DataSource
   ) {}
 
   public getFirmwares(): Promise<Firmware[]> {
-    return Firmware.find({ where: { buildStatus: BuildStatus.DONE } });
+    return Firmware.find({ where: { buildStatus: BuildStatus.READY } });
   }
 
   public getFirmware(id: string): Promise<Firmware> {
@@ -48,21 +50,24 @@ export class FirmwareService implements OnApplicationBootstrap {
   }
 
   public async onApplicationBootstrap() {
-    await getConnection()
+    await this.dataSource
       .createQueryBuilder()
       .update(Firmware)
       .set({
         buildStatus: BuildStatus.FAILED,
       })
       .where('buildStatus = :buildStatus', {
-        buildStatus: BuildStatus.BUILDING,
+        buildStatus: BuildStatus.INITIALIZED,
       })
       .execute();
 
     this.cleanAllOldReleases();
-    setInterval(() => {
-      this.cleanAllOldReleases();
-    }, 5 * 60 * 1000).unref();
+    setInterval(
+      () => {
+        this.cleanAllOldReleases();
+      },
+      5 * 60 * 1000,
+    ).unref();
   }
 
   public async cleanAllOldReleases() {
@@ -76,10 +81,10 @@ export class FirmwareService implements OnApplicationBootstrap {
   }
 
   public async cleanOldReleases(
-      owner: string = 'SlimeVR',
-      repo: string = 'SlimeVR-Tracker-ESP',
-      branch: string = 'main',
-    ): Promise<void> {
+    owner: string = 'SlimeVR',
+    repo: string = 'SlimeVR-Tracker-ESP',
+    branch: string = 'main',
+  ): Promise<void> {
     const branchRelease = await this.githubService.getRelease(
       owner,
       repo,
@@ -227,7 +232,7 @@ export class FirmwareService implements OnApplicationBootstrap {
       Prefix: dir,
     };
 
-    const listedObjects = await this.s3.listObjectsV2(listParams).promise();
+    const listedObjects = await this.s3.listObjectsV2(listParams);
 
     if (listedObjects.Contents.length === 0) return;
 
@@ -240,19 +245,17 @@ export class FirmwareService implements OnApplicationBootstrap {
       deleteParams.Delete.Objects.push({ Key });
     });
 
-    await this.s3.deleteObjects(deleteParams).promise();
+    await this.s3.deleteObjects(deleteParams);
 
     if (listedObjects.IsTruncated) await this.emptyS3Directory(bucket, dir);
   }
 
   uploadFirmware(id: string, name: string, buffer: Buffer) {
-    return this.s3
-      .upload({
-        Bucket: this.appConfig.getBuildsBucket(),
-        Key: path.join(id, name),
-        Body: buffer,
-      })
-      .promise();
+    return this.s3.putObject({
+      Bucket: this.appConfig.getBuildsBucket(),
+      Key: path.join(id, name),
+      Body: buffer,
+    });
   }
 
   public getFirmwareLink(id: string) {
@@ -264,28 +267,29 @@ export class FirmwareService implements OnApplicationBootstrap {
 
     try {
       this.buildStatusSubject.next({
-        buildStatus: BuildStatus.BUILDING,
+        buildStatus: BuildStatus.INITIALIZED,
         id: firmware.id,
         message: 'Creating temporary build folder',
       });
 
       tmpDir = await mkdtemp(path.join(os.tmpdir(), 'slimevr-api'));
 
-      const releaseFileName = `release-${release.name.replace(/[^A-Za-z0-9. ]/gi, '_')}.zip`;
+      const releaseFileName = `release-${release.name.replace(
+        /[^A-Za-z0-9. ]/gi,
+        '_',
+      )}.zip`;
       const releaseFilePath = path.join(tmpDir, releaseFileName);
 
       const downloadFile = async (url: string, path: string) => {
         const res = await fetch(url);
         const fileStream = fs.createWriteStream(path);
-        await new Promise((resolve, reject) => {
-          res.body.pipe(fileStream);
-          res.body.on('error', reject);
-          fileStream.on('finish', resolve);
-        });
+        await finished(
+          Readable.fromWeb(res.body as NodeReadableStream).pipe(fileStream),
+        );
       };
 
       this.buildStatusSubject.next({
-        buildStatus: BuildStatus.BUILDING,
+        buildStatus: BuildStatus.INITIALIZED,
         id: firmware.id,
         message: 'Downloading SlimeVR firmware from Github',
       });
@@ -293,7 +297,7 @@ export class FirmwareService implements OnApplicationBootstrap {
       await downloadFile(release.zipball_url, releaseFilePath);
 
       this.buildStatusSubject.next({
-        buildStatus: BuildStatus.BUILDING,
+        buildStatus: BuildStatus.INITIALIZED,
         id: firmware.id,
         message: 'Extracting firmware',
       });
@@ -308,7 +312,7 @@ export class FirmwareService implements OnApplicationBootstrap {
       });
 
       this.buildStatusSubject.next({
-        buildStatus: BuildStatus.BUILDING,
+        buildStatus: BuildStatus.INITIALIZED,
         id: firmware.id,
         message: 'Setting up defines and configs',
       });
@@ -321,14 +325,18 @@ export class FirmwareService implements OnApplicationBootstrap {
         // negate it to match the firmware rotation direction,
         // then convert it to radians
         return (-(rotation % 360) / 180) * Math.PI;
-      }
+      };
 
       const definesContent = `
         #define IMU ${firmware.buildConfig.imus[0].type}
         #define SECOND_IMU ${firmware.buildConfig.imus[1].type}
         #define BOARD ${firmware.buildConfig.board.type}
-        #define IMU_ROTATION ${rotationToFirmware(firmware.buildConfig.imus[0].rotation)}
-        #define SECOND_IMU_ROTATION ${rotationToFirmware(firmware.buildConfig.imus[1].rotation)}
+        #define IMU_ROTATION ${rotationToFirmware(
+          firmware.buildConfig.imus[0].rotation,
+        )}
+        #define SECOND_IMU_ROTATION ${rotationToFirmware(
+          firmware.buildConfig.imus[1].rotation,
+        )}
 
         #define BATTERY_MONITOR ${firmware.buildConfig.battery.type}
         #define BATTERY_SHIELD_RESISTANCE ${
@@ -353,7 +361,7 @@ export class FirmwareService implements OnApplicationBootstrap {
       ]);
 
       this.buildStatusSubject.next({
-        buildStatus: BuildStatus.BUILDING,
+        buildStatus: BuildStatus.INITIALIZED,
         id: firmware.id,
         message: 'Building Firmware (this might take a minute)',
       });
@@ -368,14 +376,14 @@ export class FirmwareService implements OnApplicationBootstrap {
               ...process.env,
               // Git commit hash or release tag
               GIT_REV: release.id,
-            }
+            },
           },
         );
 
         platformioRun.stdout.on('data', (data) => {
           console.log('[BUILD LOG]', `[${firmware.id}]`, data.toString());
           this.buildStatusSubject.next({
-            buildStatus: BuildStatus.BUILDING,
+            buildStatus: BuildStatus.INITIALIZED,
             id: firmware.id,
             message: 'Building Firmware (this might take a minute)',
           });
@@ -393,7 +401,7 @@ export class FirmwareService implements OnApplicationBootstrap {
       });
 
       this.buildStatusSubject.next({
-        buildStatus: BuildStatus.BUILDING,
+        buildStatus: BuildStatus.INITIALIZED,
         id: firmware.id,
         message: 'Uploading Firmware to Bucket',
       });
@@ -410,7 +418,7 @@ export class FirmwareService implements OnApplicationBootstrap {
         ),
       );
 
-      firmware.buildStatus = BuildStatus.DONE;
+      firmware.buildStatus = BuildStatus.READY;
       firmware.firmwareFiles = files.map(({ offset }, index) => ({
         offset,
         url: `${this.appConfig.getBuildsBucket()}/${
@@ -420,7 +428,7 @@ export class FirmwareService implements OnApplicationBootstrap {
       await Firmware.save(firmware);
 
       this.buildStatusSubject.next({
-        buildStatus: BuildStatus.DONE,
+        buildStatus: BuildStatus.READY,
         id: firmware.id,
         message: 'Build complete',
         firmwareFiles: firmware.firmwareFiles,
@@ -451,7 +459,11 @@ export class FirmwareService implements OnApplicationBootstrap {
 
   public async buildFirmware(dto: BuildFirmwareDTO): Promise<BuildResponse> {
     try {
-      const [_, owner, version] = dto.version.match(/(.*?)\/(.*)/) || [undefined, 'SlimeVR', dto.version];
+      const [_, owner, version] = dto.version.match(/(.*?)\/(.*)/) || [
+        undefined,
+        'SlimeVR',
+        dto.version,
+      ];
       let repo = 'SlimeVR-Tracker-ESP';
 
       // TODO: Make the site say what repo to use, please
@@ -468,11 +480,7 @@ export class FirmwareService implements OnApplicationBootstrap {
         }
       }
 
-      const release = await this.githubService.getRelease(
-        owner,
-        repo,
-        version,
-      );
+      const release = await this.githubService.getRelease(owner, repo, version);
 
       dto = BuildFirmwareDTO.completeDefaults(dto);
 
@@ -482,11 +490,11 @@ export class FirmwareService implements OnApplicationBootstrap {
 
       if (!firmware) firmware = Firmware.fromDTO(dto);
 
-      if (firmware.id && firmware.buildStatus === BuildStatus.BUILDING) {
+      if (firmware.id && firmware.buildStatus === BuildStatus.INITIALIZED) {
         return new BuildResponse(firmware.id, firmware.buildStatus);
       }
 
-      if (firmware.id && firmware.buildStatus === BuildStatus.DONE) {
+      if (firmware.id && firmware.buildStatus === BuildStatus.READY) {
         return new BuildResponse(
           firmware.id,
           firmware.buildStatus,
@@ -494,7 +502,7 @@ export class FirmwareService implements OnApplicationBootstrap {
         );
       }
 
-      firmware.buildStatus = BuildStatus.BUILDING;
+      firmware.buildStatus = BuildStatus.INITIALIZED;
       firmware.releaseID = release.id;
 
       firmware = await Firmware.save(firmware);
